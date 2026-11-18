@@ -40,6 +40,9 @@ const TOOLS_PY = process.env.CHEL_TOOLS ?? process.env.FISHBOWL_CHEL_TOOLS ?? re
 const PYTHON = process.env.CHEL_PYTHON ?? "python3";
 const MODE = (process.env.CHEL_MODE ?? "assistant") === "episode" ? "episode" : "assistant";
 const RECORD = process.env.CHEL_RECORD === "1";
+// Agent-written verbs execute model-authored Python (policy-checked, in a resource-limited
+// subprocess). Opt-in outside containers.
+const VERBS = process.env.CHEL_VERBS === "1";
 const MAX_CALLS_PER_DECISION = 16;
 const MAX_PROPOSALS_PER_DECISION = 4;
 const MAX_CALLS_WRAPUP = 24;
@@ -49,14 +52,14 @@ const INJECT_RULES = 5;
 
 const MEMENTO_TOOLS = ["memento_status", "memento_history", "memento_propose", "memento_simplify"] as const;
 const SCRATCH_TOOLS = ["scratch_list", "scratch_read", "scratch_write", "scratch_delete", "scratch_commit"] as const;
-const LEDGER_TOOLS = ["ledger_status", "ledger_recall", "ledger_propose"] as const;
+const LEDGER_TOOLS = ["ledger_status", "ledger_recall", "ledger_propose", "ledger_define_verb"] as const;
 type BackendTool = (typeof MEMENTO_TOOLS)[number] | (typeof SCRATCH_TOOLS)[number] | (typeof LEDGER_TOOLS)[number];
 const CHEL_TOOLS = new Set<string>([
-	...LEDGER_TOOLS,
+	...LEDGER_TOOLS.filter((name) => VERBS || name !== "ledger_define_verb"),
 	...SCRATCH_TOOLS,
 	...(MODE === "episode" ? [...MEMENTO_TOOLS, "submit_action"] : []),
 ]);
-const PROPOSAL_TOOLS = new Set<string>(["memento_propose", "memento_simplify", "ledger_propose"]);
+const PROPOSAL_TOOLS = new Set<string>(["memento_propose", "memento_simplify", "ledger_propose", "ledger_define_verb"]);
 
 type Mode = "idle" | "decision" | "wrapup" | "assistant";
 const state = {
@@ -173,7 +176,8 @@ export default function (pi: ExtensionAPI) {
 			"Propose a rule (op=add), replace one (op=revise, target) or retract one (op=retract, target, reason). " +
 				"A rule is {id, text, when, then}: `when` maps obs.<field>/action.<field> to a literal, a list, or " +
 				"{ne|lt|le|gt|ge: v}; `then` maps a result field to {set: v}, {copy: 'obs.f'} or {expr: E} " +
-				"(E: const, ref, add sub mul div min max round abs, eq ne lt le gt ge, and or not, if). " +
+				"(E: const, ref, add sub mul div min max round abs, eq ne lt le gt ge, and or not, if, and " +
+				"{op: 'call', verb, args} for a defined verb). " +
 				"It is accepted only with zero counterexamples across ALL recorded history and enough support; " +
 				"rejections return the counterexamples.",
 			Type.Object({
@@ -185,6 +189,28 @@ export default function (pi: ExtensionAPI) {
 			}),
 		),
 	);
+
+	if (VERBS) {
+		pi.registerTool(
+			backendTool(
+				"ledger_define_verb",
+				"Chel define verb",
+				"Define (or redefine) a verb: one pure Python function rules can call, for computations the rule " +
+					"language lacks (date differences, parsing, small lookups). Allowed: arithmetic, comparisons, if/for, " +
+					"comprehensions, abs min max round int float str len bool sorted sum any all range divmod, date datetime " +
+					"timedelta floor ceil. No imports, I/O, ** or names starting with '_'. Accepted only if it reproduces its " +
+					"2-32 worked examples; a redefinition that would break an accepted rule is refused.",
+				Type.Object({
+					name: Type.String(),
+					params: Type.Array(Type.String()),
+					doc: Type.String({ description: "what it computes" }),
+					source: Type.String({ description: "def name(params):\n    return ..." }),
+					examples_json: Type.String({ description: "JSON list of {args: [...], result: value}" }),
+					rationale: Type.Optional(Type.String()),
+				}),
+			),
+		);
+	}
 
 	// ---------------------------------------------------------------- scratch tools
 	pi.registerTool(

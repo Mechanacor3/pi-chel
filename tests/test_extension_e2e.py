@@ -73,6 +73,8 @@ class ChelPiEndToEnd(unittest.TestCase):
         self.assertIn("Chel verified rules", injected)
         self.assertIn("fee-economy", injected)
         self.assertNotIn("fee-flat", injected)  # the rejected rule was never accepted
+        tools = {x["function"]["name"] for x in self.upstream.requests[0]["tools"]}
+        self.assertNotIn("ledger_define_verb", tools)  # model-written code is opt-in (CHEL_VERBS=1)
 
     def test_episode_mode_is_driver_controlled(self):
         self.start(EPISODE, {"CHEL_MODE": "episode", "CHEL_WORKSPACE": "/work"})
@@ -86,6 +88,22 @@ class ChelPiEndToEnd(unittest.TestCase):
         self.assertEqual(ends[2]["result"]["details"], {"step": 1, "action": "harvest"})
         tools = {t["function"]["name"] for t in self.upstream.requests[0]["tools"]}
         self.assertTrue({"memento_propose", "submit_action", "ledger_propose"} <= tools)
+
+    def test_verbs_are_opt_in_and_callable_from_rules(self):
+        verb = {"name": "pct", "params": ["x", "p"], "doc": "p percent of x", "source": "def pct(x, p):\n    return x * p / 100\n"}
+        rule = {"id": "fee-pct", "text": "Economy fee is the larger of $50 and 15% of the fare.",
+                "when": {"action.kind": "lookup_fee", "obs.arg_cabin": "economy"},
+                "then": {"fee": {"expr": {"op": "max", "args": [{"const": 50}, {"op": "call", "verb": "pct", "args": [{"ref": "obs.arg_price"}, {"const": 15}]}]}}}}
+        plans = {"Check fees": ASSISTANT["Check fees"],
+                 "Define": [[("ledger_define_verb", {**verb, "examples_json": json.dumps([{"args": [200, 15], "result": 30}, {"args": [600, 15], "result": 90}])})],
+                            [("ledger_propose", {"op": "add", "rule_json": json.dumps(rule)})]]}
+        self.start(plans, {"CHEL_RECORD": "1", "CHEL_VERBS": "1"})
+        self.pi.prompt("Check fees for two economy fares.")
+        self.pi.prompt("Define a helper and a rule.")
+        ends = {e["toolName"]: json.loads(e["result"]["content"][0]["text"]) for e in self.pi.tool_ends() if e["toolName"].startswith("ledger")}
+        self.assertTrue(ends["ledger_define_verb"]["accepted"], ends)
+        self.assertTrue(ends["ledger_propose"]["accepted"], ends)
+        self.assertTrue((self.work / ".pi" / "chel" / "chel-ledger" / "verbs" / "pct.py").exists())
 
 
 if __name__ == "__main__":

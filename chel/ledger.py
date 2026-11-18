@@ -15,8 +15,12 @@ without a single contradiction -- but lets each rule claim only what it states.
            fields to an effect: {"set": v}, {"copy": "obs.f"|"action.f"} or
            {"expr": E}, where E is a small terminating expression language
            (const, ref, add sub mul div min max round abs, eq ne lt le gt ge,
-           and or not, if).  The text is the human-readable statement; the
-           when/then clause is what gets checked.
+           and or not, if, and `call` of an agent-defined verb).  The text is
+           the human-readable statement; the when/then clause is what gets checked.
+  verb     an agent-written pure function (see verbs.py) that rules can call,
+           e.g. date differences.  A verb is accepted only if it passes the
+           static policy and reproduces its own worked examples in the sandbox;
+           redefining a verb is refused if any active rule would then break.
 
 A transition *supports* a rule when `when` holds, every `then` field is present
 in next_obs, and every prediction matches (numbers within `TOLERANCE`).  It is a
@@ -36,7 +40,7 @@ byte-identical files.
 CLI:
   ledger.py --workspace W init [--min-support 2]
   ledger.py --workspace W record  < transitions.jsonl
-  ledger.py --workspace W propose < {"op": "add"|"revise"|"retract", ...}
+  ledger.py --workspace W propose < {"op": "add"|"revise"|"retract"|"define_verb", ...}
   ledger.py --workspace W status | rules | recall "query" [--top-k 3]
 """
 from __future__ import annotations
@@ -51,6 +55,10 @@ import pathlib
 import re
 import sys
 import tempfile
+
+# Under `python3 -I` the script directory is not on sys.path; import siblings explicitly.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from verbs import MAX_EXAMPLES, VerbError, VerbRuntime, check_source
 
 SCHEMA = 1
 LEDGER_DIR = "chel-ledger"
@@ -141,11 +149,11 @@ def validate_transition(transition):
 
 # ------------------------------------------------------------------ rule grammar
 
-def _validate_expr(expr, depth, counter, where):
+def _validate_expr(expr, depth, counter, where, verbs=None):
     counter[0] += 1
     if counter[0] > MAX_NODES or depth > MAX_DEPTH:
         fail(f"{where}: expression too large or deep (max {MAX_NODES} nodes, depth {MAX_DEPTH})")
-    if not isinstance(expr, dict) or len(expr) not in (1, 2):
+    if not isinstance(expr, dict) or len(expr) not in (1, 2, 3):
         fail(f"{where}: expression must be {{const}}, {{ref}} or {{op, args}}")
     if set(expr) == {"const"}:
         if not scalar_ok(expr["const"]):
@@ -154,16 +162,25 @@ def _validate_expr(expr, depth, counter, where):
     if set(expr) == {"ref"}:
         check_ref(expr["ref"], where)
         return
+    if set(expr) == {"op", "verb", "args"} and expr["op"] == "call":
+        verbs = verbs or {}
+        if expr["verb"] not in verbs:
+            fail(f"{where}: unknown verb {expr['verb']!r}; define it first (known: {sorted(verbs)})")
+        if not isinstance(expr["args"], list) or len(expr["args"]) != len(verbs[expr["verb"]]["params"]):
+            fail(f"{where}: verb {expr['verb']} takes {len(verbs[expr['verb']]['params'])} arguments")
+        for arg in expr["args"]:
+            _validate_expr(arg, depth + 1, counter, where, verbs)
+        return
     if set(expr) != {"op", "args"} or expr["op"] not in ARITY or not isinstance(expr["args"], list):
         fail(f"{where}: unknown expression {sorted(expr)} / op {expr.get('op')!r}")
     arity, count = ARITY[expr["op"]], len(expr["args"])
     if (arity >= 0 and count != arity) or (arity < 0 and not -arity <= count <= 8):
         fail(f"{where}: op {expr['op']} has wrong number of arguments")
     for arg in expr["args"]:
-        _validate_expr(arg, depth + 1, counter, where)
+        _validate_expr(arg, depth + 1, counter, where, verbs)
 
 
-def validate_rule(rule, where="rule"):
+def validate_rule(rule, where="rule", verbs=None):
     if not isinstance(rule, dict) or set(rule) != {"id", "text", "when", "then"}:
         fail(f"{where}: expected exactly keys id, text, when, then")
     if not isinstance(rule["id"], str) or not RULE_ID.fullmatch(rule["id"]):
@@ -199,7 +216,7 @@ def validate_rule(rule, where="rule"):
             check_ref(arg, where)
             continue
         if kind == "expr":
-            _validate_expr(arg, 1, [0], f"{where}.then.{field}")
+            _validate_expr(arg, 1, [0], f"{where}.then.{field}", verbs)
             continue
         fail(f"{where}: invalid effect for {field}")
     return rule
@@ -229,7 +246,7 @@ class _Undefined(Exception):
     pass
 
 
-def evaluate(expr, obs, action):
+def evaluate(expr, obs, action, rt=None):
     if "const" in expr:
         return expr["const"]
     if "ref" in expr:
@@ -239,12 +256,22 @@ def evaluate(expr, obs, action):
         return value
     op = expr["op"]
     if op == "if":
-        return evaluate(expr["args"][1] if _truth(evaluate(expr["args"][0], obs, action)) else expr["args"][2], obs, action)
+        return evaluate(expr["args"][1] if _truth(evaluate(expr["args"][0], obs, action, rt)) else expr["args"][2], obs, action, rt)
     if op == "and":
-        return all(_truth(evaluate(a, obs, action)) for a in expr["args"])
+        return all(_truth(evaluate(a, obs, action, rt)) for a in expr["args"])
     if op == "or":
-        return any(_truth(evaluate(a, obs, action)) for a in expr["args"])
-    args = [evaluate(a, obs, action) for a in expr["args"]]
+        return any(_truth(evaluate(a, obs, action, rt)) for a in expr["args"])
+    args = [evaluate(a, obs, action, rt) for a in expr["args"]]
+    if op == "call":
+        if rt is None:
+            raise _Undefined()
+        try:
+            value = rt.call(expr["verb"], args)
+        except VerbError:
+            raise _Undefined() from None
+        if not scalar_ok(value):
+            raise _Undefined()
+        return value
     if op == "not":
         return not _truth(args[0])
     if op in ("eq", "ne"):
@@ -284,7 +311,7 @@ def _truth(value):
     return value
 
 
-def predict(rule, obs, action):
+def predict(rule, obs, action, rt=None):
     """Return {field: value} for fields the rule claims, MISSING when `when` fails, None if undefined."""
     if not all(condition_holds(c, lookup(r, obs, action)) for r, c in rule["when"].items()):
         return MISSING
@@ -300,17 +327,17 @@ def predict(rule, obs, action):
                     return None
                 out[field] = value
             else:
-                out[field] = evaluate(arg, obs, action)
+                out[field] = evaluate(arg, obs, action, rt)
         except _Undefined:
             return None
     return out
 
 
-def check_rule(rule, history):
+def check_rule(rule, history, rt=None):
     """Replay all of H.  Returns (support, counterexamples, abstentions)."""
     support, counter, abstain = 0, [], 0
     for index, t in enumerate(history):
-        predicted = predict(rule, t["obs"], t["action"])
+        predicted = predict(rule, t["obs"], t["action"], rt)
         if predicted is MISSING:
             continue
         if predicted is None or any(field not in t["next_obs"] for field in predicted):
@@ -353,6 +380,17 @@ def _refs(node):
     elif isinstance(node, list):
         for value in node:
             yield from _refs(value)
+
+
+def uses_verbs(node):
+    if isinstance(node, dict):
+        if node.get("op") == "call" and isinstance(node.get("verb"), str):
+            yield node["verb"]
+        for value in node.values():
+            yield from uses_verbs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from uses_verbs(value)
 
 
 def rule_shape(rule):
@@ -462,6 +500,7 @@ class Ledger:
         self.revisions = self._lines("revisions.jsonl")
         prev = GENESIS
         self.rules = {}
+        self.verbs = {}
         for index, rev in enumerate(self.revisions):
             if rev.get("prev") != prev:
                 fail(f"revision chain broken at {index}")
@@ -470,8 +509,14 @@ class Ledger:
         self.revisions_head = prev
         return self
 
+    def runtime(self):
+        return VerbRuntime(self.verbs)
+
     def _apply(self, rev):
         kind = rev["kind"]
+        if kind == "verb" and rev["accepted"]:
+            self.verbs[rev["verb"]["name"]] = rev["verb"]
+            return
         if kind in ("add", "revise") and rev["accepted"]:
             if kind == "revise":
                 self.rules[rev["target"]]["state"] = "superseded"
@@ -518,8 +563,10 @@ class Ledger:
             self.history.extend(transitions)
             self.head = head
             falsified, support = [], {}
+            with self.runtime() as rt:
+                checks = {rid: check_rule(e["rule"], transitions, rt) for rid, e in sorted(self.active().items())}
             for rule_id, entry in sorted(self.active().items()):
-                gained, counter, _ = check_rule(entry["rule"], transitions)
+                gained, counter, _ = checks[rule_id]
                 if counter:
                     ce = {**counter[0], "index": start + counter[0]["index"]}
                     self._log({"kind": "falsified", "target": rule_id, "counterexample": ce, "history_len": len(self.history)})
@@ -534,8 +581,10 @@ class Ledger:
     def propose(self, proposal):
         """Submit {"op": "add", "rule": R, "rationale"?} | {"op": "revise", "target": id, "rule": R}
         | {"op": "retract", "target": id, "reason": str}.  Every proposal is logged."""
-        if not isinstance(proposal, dict) or proposal.get("op") not in ("add", "revise", "retract"):
-            fail("proposal op must be add, revise or retract")
+        if not isinstance(proposal, dict) or proposal.get("op") not in ("add", "revise", "retract", "define_verb"):
+            fail("proposal op must be add, revise, retract or define_verb")
+        if proposal["op"] == "define_verb":
+            return self.define_verb(proposal.get("verb"), str(proposal.get("rationale", ""))[:MAX_TEXT])
         with self._lock():
             self.load()
             op = proposal["op"]
@@ -550,7 +599,7 @@ class Ledger:
             rule = proposal.get("rule")
             reasons, support, counter, abstain = [], 0, [], 0
             try:
-                validate_rule(rule)
+                validate_rule(rule, verbs=self.verbs)
             except LedgerError as exc:
                 reasons.append(str(exc))
             target = proposal.get("target") if op == "revise" else None
@@ -565,7 +614,8 @@ class Ledger:
                 if any(rule_shape(e["rule"]) == shape for rid, e in self.active().items() if rid != target):
                     reasons.append("an active rule already makes exactly this claim")
             if not reasons:
-                support, counter, abstain = check_rule(rule, self.history)
+                with self.runtime() as rt:
+                    support, counter, abstain = check_rule(rule, self.history, rt)
                 if counter:
                     reasons.append(f"contradicted by {len(counter)} recorded transition(s)")
                 if support < self.min_support:
@@ -584,12 +634,68 @@ class Ledger:
             return {"accepted": accepted, "support": support, "abstain": abstain, "reasons": reasons,
                     "counterexamples": counter[:MAX_REPORTED]}
 
+    def define_verb(self, verb, rationale=""):
+        """Accept a verb only if it passes the static policy, reproduces its examples,
+        and (when redefining) leaves every active rule that uses it unbroken."""
+        with self._lock():
+            self.load()
+            reasons, record_verb = [], None
+            try:
+                if not isinstance(verb, dict) or set(verb) - {"name", "params", "doc", "source", "examples"}:
+                    raise VerbError("verb must have name, params, doc, source, examples")
+                name, params, source = verb.get("name"), verb.get("params"), verb.get("source")
+                doc, examples = verb.get("doc", ""), verb.get("examples")
+                if not isinstance(doc, str) or not doc.strip() or len(doc) > MAX_TEXT:
+                    raise VerbError("doc must be a short description of what the verb computes")
+                check_source(name, params, source)
+                if not isinstance(examples, list) or not 2 <= len(examples) <= MAX_EXAMPLES:
+                    raise VerbError(f"give 2..{MAX_EXAMPLES} worked examples [{{args: [...], result: v}}]")
+                for ex in examples:
+                    if (not isinstance(ex, dict) or set(ex) != {"args", "result"} or not isinstance(ex["args"], list)
+                            or len(ex["args"]) != len(params) or not all(scalar_ok(a) for a in ex["args"])
+                            or not scalar_ok(ex["result"])):
+                        raise VerbError("each example is {args: [scalars, one per param], result: scalar}")
+                record_verb = {"name": name, "params": params, "doc": doc.strip(), "source": source, "examples": examples}
+                candidate = {**self.verbs, name: record_verb}
+                with VerbRuntime(candidate) as rt:
+                    for ex in examples:
+                        try:
+                            got = rt.call(name, ex["args"])
+                        except VerbError as exc:
+                            reasons.append(f"example {ex['args']} raised {exc}")
+                            continue
+                        if not same(got, ex["result"]):
+                            reasons.append(f"example {ex['args']}: expected {ex['result']!r}, got {got!r}")
+                    if not reasons and name in self.verbs:
+                        for rid, entry in sorted(self.active().items()):
+                            if name in set(uses_verbs(entry["rule"]["then"])):
+                                _, counter, _ = check_rule(entry["rule"], self.history, rt)
+                                if counter:
+                                    reasons.append(f"redefinition would break active rule {rid}")
+            except VerbError as exc:
+                reasons.append(str(exc))
+            accepted = not reasons
+            stored = record_verb or (verb if isinstance(verb, dict) and len(canonical(verb)) < 20_000 else None)
+            self._log({"kind": "verb", "verb": stored, "accepted": accepted, "reasons": reasons[:MAX_REPORTED],
+                       "rationale": rationale, "history_len": len(self.history)})
+            self._views()
+            return {"accepted": accepted, "reasons": reasons[:MAX_REPORTED]}
+
     # -- views
     def _views(self):
         self._write("rules.json", json.dumps(self.rules_view(), indent=1, ensure_ascii=False, sort_keys=True) + "\n")
         lines = ["# Chel ledger", "", f"H: {len(self.history)} transitions. Minimum support: {self.min_support}.", ""]
         for rid, e in sorted(self.rules.items()):
             lines.append(f"- **{rid}** [{e['state']}; support {e['support']}] {e['rule']['text']}")
+        if self.verbs:
+            lines += ["", "## Verbs", ""] + [f"- `{n}({', '.join(v['params'])})`: {v['doc']}" for n, v in sorted(self.verbs.items())]
+            vdir = self.dir / "verbs"
+            vdir.mkdir(exist_ok=True)
+            for n, v in self.verbs.items():
+                fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=vdir)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(f"# {v['doc']}\n# Examples: {json.dumps(v['examples'], ensure_ascii=False)[:1500]}\n{v['source'].rstrip()}\n")
+                os.replace(tmp, vdir / f"{n}.py")
         self._write("rules.md", "\n".join(lines) + "\n")
 
     def rules_view(self):
@@ -604,6 +710,7 @@ class Ledger:
             states[e["state"]] = states.get(e["state"], 0) + 1
         proposals = [r for r in self.revisions if r["kind"] in ("add", "revise")]
         return {"history_len": len(self.history), "min_support": self.min_support, "rules": states,
+                "verbs": sorted(self.verbs),
                 "proposals": len(proposals), "accepted": sum(r["accepted"] for r in proposals)}
 
     def recall(self, query, top_k=3):
@@ -648,6 +755,7 @@ def _rule_doc(rule):
         if isinstance(cond, str):
             parts.append(cond)
     parts.extend(rule["then"])
+    parts.extend(uses_verbs(rule["then"]))
     return " ".join(parts)
 
 

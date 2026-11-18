@@ -464,7 +464,19 @@ def ledger_propose(ws, args):
         raise ToolError(str(exc)) from None
 
 
+def ledger_define_verb(ws, args):
+    args = _args(args, ("name", "params", "doc", "source", "examples_json", "rationale"), ("name", "params", "doc", "source", "examples_json"))
+    verb = {"name": _str(args["name"], "name", 40), "params": args["params"], "doc": _str(args["doc"], "doc", MAX_TEXT),
+            "source": _str(args["source"], "source", 4000), "examples": _json_arg(args["examples_json"], "examples_json")}
+    try:
+        return _ledger(ws).propose({"op": "define_verb", "verb": verb,
+                                    "rationale": _str(args.get("rationale", ""), "rationale", MAX_TEXT, allow_empty=True)})
+    except LedgerError as exc:
+        raise ToolError(str(exc)) from None
+
+
 TOOLS = {
+    "ledger_define_verb": ledger_define_verb,
     "ledger_status": ledger_status,
     "ledger_recall": ledger_recall,
     "ledger_propose": ledger_propose,

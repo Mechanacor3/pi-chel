@@ -23,7 +23,7 @@ SYSTEM = """You are Chel's offline rule learner. You study recorded transitions 
 RULES that predict next_obs fields. A rule is accepted only if it holds on EVERY matching
 recorded transition (zero counterexamples) and matches at least {min_support} of them.
 
-Return one JSON object: {"rules": [RULE, ...]} with at most {max_rules} rules.
+Return one JSON object: {"verbs": [VERB, ...], "rules": [RULE, ...]} with at most {max_rules} rules.
 RULE = {"id": "short-unique-id", "text": "one plain sentence a support agent can act on",
         "when": {...}, "then": {...}}
 when: maps "obs.<field>" or "action.<field>" to a literal (equality), a list of literals
@@ -33,7 +33,18 @@ then: maps a next_obs field to {"set": literal} | {"copy": "obs.<field>"} |
       {"expr": E}. E = {"const": v} | {"ref": "obs.<field>"} |
       {"op": OP, "args": [E, ...]} with OP in add sub mul div (2 args), min max (2+),
       round (1-2: value, digits), abs (1), eq ne lt le gt ge (2), and or (1+), not (1),
-      if (3: condition, then, else). Numbers match within 0.01.
+      if (3: condition, then, else), and {"op": "call", "verb": NAME, "args": [E, ...]}.
+      Numbers match within 0.01.
+VERB (optional): when a rule needs a computation the expression language lacks -- e.g.
+      differences between dates or times, parsing part of a code or string, a small lookup --
+      define it once as a pure Python function and call it from rules:
+      {"name": "snake_case", "params": ["a", "b"], "doc": "what it computes",
+       "source": "def snake_case(a, b):\n    return ...\n",
+       "examples": [{"args": [...], "result": v}, ...]}   (2-32 worked examples, taken from the data)
+      Allowed: arithmetic, comparisons, if/for/comprehensions, local variables, the builtins abs min
+      max round int float str len bool sorted sum any all range divmod, and date, datetime, timedelta,
+      floor, ceil (e.g. date.fromisoformat(s[:10]), (d2 - d1).days). No imports, no I/O, no ** and
+      no names starting with "_". A verb is accepted only if it reproduces its examples.
 What to learn, in priority order:
 1. Policy outcomes: fees, refunds, compensation, prices, point costs, eligibility, and
    which inputs they depend on -- ideally as one formula (e.g. max(50, 0.15 * price)).
@@ -90,6 +101,8 @@ def induce(ledger, complete, *, kinds=None, rounds=3, max_rules=8, log=print):
         existing = [f"[{rid}] {e['rule']['text']}" for rid, e in ledger.active().items()
                     if e["rule"]["when"].get("action.kind") == kind]
         prompt = dossier(ledger.history, kind) + "\n\nAlready accepted rules for this action:\n" + ("\n".join(existing) or "(none)")
+        prompt += "\n\nVerbs already defined (callable from rules):\n" + ("\n".join(
+            f"- {n}({', '.join(v['params'])}): {v['doc']}" for n, v in sorted(ledger.verbs.items())) or "(none)")
         item = {"kind": kind, "transitions": counts[kind], "rounds": []}
         for round_number in range(rounds):
             try:
@@ -102,6 +115,11 @@ def induce(ledger, complete, *, kinds=None, rounds=3, max_rules=8, log=print):
                 prompt += f"\n\nYour last answer was not usable ({exc}). Return {{\"rules\": [...]}}."
                 continue
             feedback, accepted = [], 0
+            for verb in (raw.get("verbs") or [])[:4] if isinstance(raw.get("verbs"), list) else []:
+                vname = verb.get("name") if isinstance(verb, dict) else None
+                out = ledger.propose({"op": "define_verb", "verb": verb, "rationale": f"induce {kind} round {round_number + 1}"})
+                feedback.append(f"verb {vname}: {'ACCEPTED (callable now)' if out['accepted'] else 'REJECTED: ' + '; '.join(out['reasons'])[:400]}")
+                item.setdefault("verbs", []).append({"name": vname, "accepted": out["accepted"]})
             for rule in rules[:max_rules]:
                 try:
                     result = ledger.propose({"op": "add", "rule": rule, "rationale": f"induce {kind} round {round_number + 1}"})
@@ -117,7 +135,7 @@ def induce(ledger, complete, *, kinds=None, rounds=3, max_rules=8, log=print):
                                     + (f" Counterexamples: {ce}" if ce else ""))
             item["rounds"].append({"proposed": len(rules[:max_rules]), "accepted": accepted})
             log(f"  {kind} round {round_number + 1}: {accepted}/{len(rules[:max_rules])} accepted")
-            if all(line.endswith(")") and "ACCEPTED" in line for line in feedback):
+            if all("ACCEPTED" in line for line in feedback):
                 break
             prompt += ("\n\nGate results for your last proposal:\n" + "\n".join(feedback) +
                        "\nRepair rejected rules (add the missing condition, fix the formula, or narrow the claim) "

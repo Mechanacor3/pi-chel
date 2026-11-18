@@ -74,6 +74,27 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(len(got), 1)
             self.assertIn("verified on 3 past tool results", got[0])
 
+    def test_induction_can_define_a_verb_and_use_it(self):
+        days = {"name": "days_between", "params": ["a", "b"], "doc": "days from a to b",
+                "source": "def days_between(a, b):\n    return (date.fromisoformat(b[:10]) - date.fromisoformat(a[:10])).days\n",
+                "examples": [{"args": ["2026-06-01", "2026-06-11"], "result": 10}, {"args": ["2026-06-01", "2026-06-02"], "result": 1}]}
+        rule = {"id": "lead", "text": "The lead time field equals days from booking to departure.",
+                "when": {"action.kind": "quote"},
+                "then": {"lead_days": {"expr": {"op": "call", "verb": "days_between", "args": [{"ref": "obs.booked_at"}, {"ref": "obs.departure"}]}}}}
+        prompts = []
+
+        def complete(system, prompt):
+            prompts.append(prompt)
+            return json.dumps({"verbs": [days], "rules": [rule]})
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger.create(pathlib.Path(tmp))
+            ledger.record([{"obs": {"booked_at": b, "departure": d}, "action": {"kind": "quote"}, "next_obs": {"lead_days": n}}
+                           for b, d, n in (("2026-06-01", "2026-06-20", 19), ("2026-05-01", "2026-05-03", 2))])
+            trace = learn.induce(ledger, complete, rounds=2, log=lambda *_: None)
+            self.assertEqual(trace[0]["verbs"], [{"name": "days_between", "accepted": True}])
+            self.assertEqual(trace[0]["rounds"], [{"proposed": 1, "accepted": 1}])
+            self.assertIn("call", prompts[0])
+
     def test_dossier_shows_varying_inputs_and_results(self):
         history = []
         for price, fee in ((300, 50), (600, 90)):

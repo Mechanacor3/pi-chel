@@ -19,6 +19,17 @@ accepted rule, and a rule that stops holding is marked *falsified*, never silent
   ```
   A rule is accepted only with zero counterexamples across all history and enough supporting
   cases (default 2).
+- **Verbs** (`chel/verbs.py`). When a belief needs something the rule language cannot
+  express, such as a date difference, parsing a code, or a small lookup, the agent writes its own
+  helper: one pure Python function that rules call as `{"op": "call", "verb": ..., "args": [...]}`.
+  A verb is accepted only if it:
+  - passes a static policy: one function, whitelisted syntax and builtins (`date`, `datetime`,
+    `timedelta`, `floor`, `ceil`), and no imports, I/O, `**`, dunders, lambdas or `while`;
+  - reproduces its own 2–32 worked examples, run in a separate interpreter with CPU, memory,
+    file and fork limits plus a per-call timer.
+
+  Rules that call a verb still face the unchanged replay gate. A redefinition that would break an
+  accepted rule is refused. Accepted verbs are also written to `chel-ledger/verbs/<name>.py`.
 - **Memento** (closed world, `chel/memento_memory.py`). A ψ rulebook plus an executable θ
   model that must reproduce *every* field of *every* recorded transition. Mismatches are routed
   as `BELIEF_ERROR` (fix ψ) or `IMPLEMENTATION_ERROR` (fix θ), and simplifications must pass the
@@ -48,6 +59,7 @@ rules most relevant to your prompt as a short hidden message.
 |---|---|---|
 | `CHEL_WORKSPACE` | `<cwd>/.pi/chel` | Where the ledger, notes and Git history live |
 | `CHEL_RECORD` | off | `1` records every non-Chel tool result that is a JSON object as history (`arg_*` inputs, result fields) |
+| `CHEL_VERBS` | off | `1` offers `ledger_define_verb`. It runs model-written (policy-checked, resource-limited) Python, so turn it on deliberately, ideally in a container |
 | `CHEL_MODE` | `assistant` | `episode` for the testbed protocol below |
 | `CHEL_PYTHON` | `python3` | Interpreter for the backend |
 
@@ -107,6 +119,8 @@ Results are in [Results](#results).
   paths, and history is appended only by trusted code.
 - Scratch paths cannot be hidden names, symlinks or escapes. Git runs with hooks, fsmonitor,
   signing, and global/system configuration disabled.
+- Verbs are defence in depth (static policy, sandboxed process, rlimits), not a proof of safety.
+  They are off by default in the Pi extension.
 - Field names that look like privileged channels (`secret`, `credential`, `api_key`, …) are
   refused as a tripwire. Do not record data the agent should not see.
 
@@ -133,7 +147,9 @@ What Chel changes or adds:
 - **θ is not free Python.** It is a small, terminating JSON expression language, and its
   faithfulness to ψ is checked deterministically (structural traceability plus differential
   agreement on a bounded probe set) instead of by a model judgment. That trades expressiveness
-  for safety and auditability inside isolated agents.
+  for safety and auditability inside isolated agents. To get back some of the paper's
+  expressiveness, the agent may add **verbs**: small, policy-checked, sandboxed Python helpers,
+  versioned in the ledger, that rules can call.
 - **Open-world rule ledger** (`chel/ledger.py`). Independent, partial rules that must hold on all
   history with no counterexample. This is our extension for tool-using agents whose
   observations are too wide to predict in full.
