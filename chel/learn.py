@@ -138,7 +138,13 @@ def _verbs_text(ledger):
 def _session(ledger, complete, system, prompt, label, item, rounds, max_rules, log):
     for round_number in range(rounds):
         try:
-            raw = json.loads(complete(system, prompt))
+            text = complete(system, prompt)
+        except Exception as exc:  # a refused or failed model call ends this session, not the build
+            item["rounds"].append({"model_error": str(exc)[:300]})
+            log(f"  {label}: model call failed, skipping session ({str(exc)[:120]})")
+            return
+        try:
+            raw = json.loads(text)
             rules = raw.get("rules") if isinstance(raw, dict) else None
             if not isinstance(rules, list):
                 raise ValueError("response has no rules list")

@@ -122,6 +122,15 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(trace[1]["rounds"], [{"proposed": 1, "accepted": 1}])
             self.assertEqual(learn.unexplained_numeric_fields(ledger.load(), "change"), [])
 
+    def test_a_failed_model_call_skips_the_session_not_the_build(self):
+        def complete(system, prompt):
+            raise RuntimeError("HTTP 400: prompt flagged")
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger.create(pathlib.Path(tmp))
+            ledger.record([{"obs": {"a": i}, "action": {"kind": "k"}, "next_obs": {"b": i}} for i in range(3)])
+            trace = learn.induce(ledger, complete, log=lambda *_: None)
+            self.assertIn("model_error", trace[0]["rounds"][0])
+
     def test_dossier_shows_varying_inputs_and_results(self):
         history = []
         for price, fee in ((300, 50), (600, 90)):
