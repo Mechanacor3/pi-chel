@@ -121,21 +121,22 @@ docker build -t pi-plugin-e2e:pi-1.0.0 tests/e2e && python3 -m unittest tests.te
 ## Background and credits
 
 Chel's Memento store follows the design of **Memento 3**
-([arXiv:2610.11794](https://arxiv.org/abs/2610.11794)): an agent with a frozen model keeps a
-natural-language rulebook of hypotheses about its environment, compiles it into executable code
-for prediction, and uses prediction errors to revise both. An updated model is accepted only if
-it is faithful to the rulebook and replay reproduces the observed transitions.
+([arXiv:2610.11794](https://arxiv.org/abs/2610.11794)). A frozen-model agent keeps a Markdown
+rulebook ψ of hypotheses about its environment and compiles it into an executable Python model θ
+in a Git-versioned workspace. On a prediction mismatch it chooses to keep the model, revise the
+rulebook, or repair only the code. A candidate is accepted only if the model judges θ faithful to
+ψ *and* exact replay reproduces the entire recorded history. An MDL bias prefers shorter
+descriptions. Chel keeps that loop, including the belief-versus-implementation routing and the
+simplification preference.
 
 What Chel changes or adds:
-- **Faithfulness check.** θ is a small, terminating JSON expression language, not generated
-  Python. Faithfulness to ψ is checked deterministically (structural traceability plus
-  differential agreement on a bounded probe set), not judged by a model.
-- **Full replay and error routing.** Replay always covers the complete recorded history H.
-  Mismatches are routed explicitly as `BELIEF_ERROR` (revise ψ) or `IMPLEMENTATION_ERROR` (repair
-  θ). That routing and the MDL-style simplification gate are Chel's own framing.
-- **Open-world rule ledger** (`chel/ledger.py`). Independent partial rules that must hold on all
-  history with no counterexample. This is our extension for tool-using agents whose observations
-  are too wide to predict in full.
+- **θ is not free Python.** It is a small, terminating JSON expression language, and its
+  faithfulness to ψ is checked deterministically (structural traceability plus differential
+  agreement on a bounded probe set) instead of by a model judgment. That trades expressiveness
+  for safety and auditability inside isolated agents.
+- **Open-world rule ledger** (`chel/ledger.py`). Independent, partial rules that must hold on all
+  history with no counterexample. This is our extension for tool-using agents whose
+  observations are too wide to predict in full.
 - Nothing here is the paper authors' code. Any errors are ours.
 
 If you use Chel, please cite the paper:
