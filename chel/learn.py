@@ -97,8 +97,100 @@ def dossier(history, kind, sample=24, max_fields=40):
     return "\n".join(lines)
 
 
-def induce(ledger, complete, *, kinds=None, rounds=3, max_rules=8, log=print):
-    """Run bounded propose/repair rounds per action kind.  Returns a trace list."""
+def field_dossier(history, kind, field, sample=30, max_fields=36):
+    """Rows of one action where `field` is present, sampled across its distinct values."""
+    rows = [t for t in history if t["action"].get("kind") == kind and field in t["next_obs"]]
+    by_value = {}
+    for t in rows:
+        by_value.setdefault(_short(t["next_obs"][field]), []).append(t)
+    picked, i = [], 0
+    while len(picked) < min(sample, len(rows)):
+        for group in by_value.values():
+            if i < len(group) and len(picked) < sample:
+                picked.append(group[i])
+        i += 1
+    obs_fields = Counter(f for t in rows for f in t["obs"])
+    varying = sorted((f for f, c in obs_fields.items() if c >= max(2, len(rows) // 3)
+                      and len({_short(t["obs"].get(f)) for t in rows}) > 1),
+                     key=lambda f: (not f.startswith("arg_"), -obs_fields[f], f))[:max_fields]
+    constant = sorted(f for f, c in obs_fields.items() if c == len(rows) and len({_short(t["obs"].get(f)) for t in rows}) == 1)
+    values = Counter(_short(t["next_obs"][field], 30) for t in rows)
+    lines = [f"TARGET: explain how next_obs.{field} of action {kind} is determined.",
+             f"Rows with {field}: {len(rows)}; {len(values)} distinct values: " + ", ".join(f"{v} ({n})" for v, n in values.most_common(12)),
+             "Propose rules that each cover a subset of rows (via `when`) and predict this field exactly, together "
+             "covering as many rows as possible. Use a verb when the value depends on a derived quantity the expression "
+             "language cannot compute (for example a difference between two date fields, including a constant reference date)."]
+    if constant:
+        lines.append("Constant in every row (usable as reference values): " +
+                     ", ".join(f"{f}={_short(rows[0]['obs'][f], 40)}" for f in constant[:max_fields]))
+    lines.append(f"Sample rows ({len(picked)}), spread across the target's values:")
+    for t in picked:
+        o = {f: t["obs"][f] for f in varying if f in t["obs"]}
+        lines.append(f"{field}={json.dumps(t['next_obs'][field])} <- obs={json.dumps(o, ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
+def _verbs_text(ledger):
+    return "\n\nVerbs already defined (callable from rules):\n" + ("\n".join(
+        f"- {n}({', '.join(v['params'])}): {v['doc']}" for n, v in sorted(ledger.verbs.items())) or "(none)")
+
+
+def _session(ledger, complete, system, prompt, label, item, rounds, max_rules, log):
+    for round_number in range(rounds):
+        try:
+            raw = json.loads(complete(system, prompt))
+            rules = raw.get("rules") if isinstance(raw, dict) else None
+            if not isinstance(rules, list):
+                raise ValueError("response has no rules list")
+        except (ValueError, TypeError) as exc:
+            item["rounds"].append({"error": str(exc)[:300]})
+            prompt += f"\n\nYour last answer was not usable ({exc}). Return {{\"rules\": [...]}}."
+            continue
+        feedback, accepted = [], 0
+        for verb in (raw.get("verbs") or [])[:4] if isinstance(raw.get("verbs"), list) else []:
+            vname = verb.get("name") if isinstance(verb, dict) else None
+            out = ledger.propose({"op": "define_verb", "verb": verb, "rationale": f"induce {label} round {round_number + 1}"})
+            feedback.append(f"verb {vname}: {'ACCEPTED (callable now)' if out['accepted'] else 'REJECTED: ' + '; '.join(out['reasons'])[:400]}")
+            item.setdefault("verbs", []).append({"name": vname, "accepted": out["accepted"]})
+        for rule in rules[:max_rules]:
+            try:
+                result = ledger.propose({"op": "add", "rule": rule, "rationale": f"induce {label} round {round_number + 1}"})
+            except LedgerError as exc:
+                result = {"accepted": False, "reasons": [str(exc)], "counterexamples": []}
+            rid = rule.get("id") if isinstance(rule, dict) else None
+            if result["accepted"]:
+                accepted += 1
+                feedback.append(f"[{rid}] ACCEPTED (support {result['support']})")
+            else:
+                ce = "; ".join(_short(c, 700) for c in result.get("counterexamples", [])[:2])
+                feedback.append(f"[{rid}] REJECTED: {'; '.join(result['reasons'])[:400]}"
+                                + (f" Counterexamples: {ce}" if ce else ""))
+        item["rounds"].append({"proposed": len(rules[:max_rules]), "accepted": accepted})
+        log(f"  {label} round {round_number + 1}: {accepted}/{len(rules[:max_rules])} accepted")
+        if feedback and all("ACCEPTED" in line for line in feedback):
+            break
+        prompt += ("\n\nGate results for your last proposal:\n" + "\n".join(feedback) +
+                   "\nRepair rejected rules (add the missing condition, fix the formula, or narrow the claim) "
+                   "using NEW ids, or propose different rules. Do not resubmit accepted rules.")
+
+
+def unexplained_numeric_fields(ledger, kind, min_distinct=2):
+    """Numeric result fields of `kind` that vary and that no active rule for `kind` claims."""
+    rows = [t for t in ledger.history if t["action"].get("kind") == kind]
+    claimed = {f for e in ledger.active().values() if e["rule"]["when"].get("action.kind") == kind for f in e["rule"]["then"]}
+    counts = Counter(f for t in rows for f, v in t["next_obs"].items()
+                     if type(v) in (int, float) and type(v) is not bool)
+    out = []
+    for field, n in counts.most_common():
+        distinct = {t["next_obs"][field] for t in rows if field in t["next_obs"]}
+        if field not in claimed and n >= max(ledger.min_support, 4) and len(distinct) >= min_distinct:
+            out.append(field)
+    return out
+
+
+def induce(ledger, complete, *, kinds=None, rounds=3, max_rules=8, log=print, target_fields=True, max_targets=6):
+    """Bounded propose/repair rounds per action kind, then focused rounds on each varying
+    numeric result field the accepted rules do not yet explain.  Returns a trace list."""
     ledger.load()
     counts = Counter(t["action"].get("kind") for t in ledger.history)
     kinds = kinds or [k for k, n in counts.most_common() if k is not None and n >= ledger.min_support]
@@ -109,44 +201,17 @@ def induce(ledger, complete, *, kinds=None, rounds=3, max_rules=8, log=print):
         existing = [f"[{rid}] {e['rule']['text']}" for rid, e in ledger.active().items()
                     if e["rule"]["when"].get("action.kind") == kind]
         prompt = dossier(ledger.history, kind) + "\n\nAlready accepted rules for this action:\n" + ("\n".join(existing) or "(none)")
-        prompt += "\n\nVerbs already defined (callable from rules):\n" + ("\n".join(
-            f"- {n}({', '.join(v['params'])}): {v['doc']}" for n, v in sorted(ledger.verbs.items())) or "(none)")
+        prompt += _verbs_text(ledger)
         item = {"kind": kind, "transitions": counts[kind], "rounds": []}
-        for round_number in range(rounds):
-            try:
-                raw = json.loads(complete(system, prompt))
-                rules = raw.get("rules") if isinstance(raw, dict) else None
-                if not isinstance(rules, list):
-                    raise ValueError("response has no rules list")
-            except (ValueError, TypeError) as exc:
-                item["rounds"].append({"error": str(exc)[:300]})
-                prompt += f"\n\nYour last answer was not usable ({exc}). Return {{\"rules\": [...]}}."
-                continue
-            feedback, accepted = [], 0
-            for verb in (raw.get("verbs") or [])[:4] if isinstance(raw.get("verbs"), list) else []:
-                vname = verb.get("name") if isinstance(verb, dict) else None
-                out = ledger.propose({"op": "define_verb", "verb": verb, "rationale": f"induce {kind} round {round_number + 1}"})
-                feedback.append(f"verb {vname}: {'ACCEPTED (callable now)' if out['accepted'] else 'REJECTED: ' + '; '.join(out['reasons'])[:400]}")
-                item.setdefault("verbs", []).append({"name": vname, "accepted": out["accepted"]})
-            for rule in rules[:max_rules]:
-                try:
-                    result = ledger.propose({"op": "add", "rule": rule, "rationale": f"induce {kind} round {round_number + 1}"})
-                except LedgerError as exc:
-                    result = {"accepted": False, "reasons": [str(exc)], "counterexamples": []}
-                rid = rule.get("id") if isinstance(rule, dict) else None
-                if result["accepted"]:
-                    accepted += 1
-                    feedback.append(f"[{rid}] ACCEPTED (support {result['support']})")
-                else:
-                    ce = "; ".join(_short(c, 700) for c in result.get("counterexamples", [])[:2])
-                    feedback.append(f"[{rid}] REJECTED: {'; '.join(result['reasons'])[:400]}"
-                                    + (f" Counterexamples: {ce}" if ce else ""))
-            item["rounds"].append({"proposed": len(rules[:max_rules]), "accepted": accepted})
-            log(f"  {kind} round {round_number + 1}: {accepted}/{len(rules[:max_rules])} accepted")
-            if all("ACCEPTED" in line for line in feedback):
-                break
-            prompt += ("\n\nGate results for your last proposal:\n" + "\n".join(feedback) +
-                       "\nRepair rejected rules (add the missing condition, fix the formula, or narrow the claim) "
-                       "using NEW ids, or propose different rules. Do not resubmit accepted rules.")
+        _session(ledger, complete, system, prompt, kind, item, rounds, max_rules, log)
         trace.append(item)
+        if not target_fields:
+            continue
+        ledger.load()
+        for field in unexplained_numeric_fields(ledger, kind)[:max_targets]:
+            ledger.load()
+            prompt = field_dossier(ledger.history, kind, field) + _verbs_text(ledger)
+            target = {"kind": kind, "target": field, "rounds": []}
+            _session(ledger, complete, system, prompt, f"{kind}.{field}", target, rounds, max_rules, log)
+            trace.append(target)
     return trace

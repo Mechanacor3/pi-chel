@@ -95,6 +95,33 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(trace[0]["rounds"], [{"proposed": 1, "accepted": 1}])
             self.assertIn("call", prompts[0])
 
+    def test_unexplained_numeric_fields_get_a_targeted_session(self):
+        days = {"name": "days_until", "params": ["now", "when"], "doc": "days from now to when",
+                "source": "def days_until(now, when):\n    return (date.fromisoformat(when[:10]) - date.fromisoformat(now[:10])).days\n",
+                "examples": [{"args": ["2026-06-15", "2026-06-20"], "result": 5}, {"args": ["2026-06-15", "2026-06-25"], "result": 10}]}
+        tier = {"id": "tier", "text": "Changes under 7 days before departure cost $150, otherwise $75.",
+                "when": {"action.kind": "change"},
+                "then": {"fee": {"expr": {"op": "if", "args": [{"op": "lt", "args": [
+                    {"op": "call", "verb": "days_until", "args": [{"ref": "obs.now"}, {"ref": "obs.departure"}]}, {"const": 7}]},
+                    {"const": 150}, {"const": 75}]}}}}
+        prompts = []
+
+        def complete(system, prompt):
+            prompts.append(prompt)
+            if prompt.startswith("TARGET: explain how next_obs.fee"):
+                return json.dumps({"verbs": [days], "rules": [tier]})
+            return json.dumps({"rules": []})
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger.create(pathlib.Path(tmp))
+            ledger.record([{"obs": {"now": "2026-06-15T10:00:00", "departure": dep}, "action": {"kind": "change"}, "next_obs": {"fee": fee}}
+                           for dep, fee in (("2026-06-17", 150), ("2026-06-19", 150), ("2026-06-30", 75), ("2026-07-09", 75))])
+            self.assertEqual(learn.unexplained_numeric_fields(ledger.load(), "change"), ["fee"])
+            trace = learn.induce(ledger, complete, rounds=1, log=lambda *_: None)
+            self.assertEqual([t.get("target") for t in trace], [None, "fee"])
+            self.assertIn('now="2026-06-15T10:00:00"', prompts[1])
+            self.assertEqual(trace[1]["rounds"], [{"proposed": 1, "accepted": 1}])
+            self.assertEqual(learn.unexplained_numeric_fields(ledger.load(), "change"), [])
+
     def test_dossier_shows_varying_inputs_and_results(self):
         history = []
         for price, fee in ((300, 50), (600, 90)):
