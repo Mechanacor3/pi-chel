@@ -181,7 +181,33 @@ Evaluation uses [STATE-Bench](https://github.com/microsoft/STATE-Bench) (MIT) an
 
 ## Results
 
-STATE-Bench pilot results will be added here.
+Evaluated on the [STATE-Bench](https://github.com/microsoft/STATE-Bench) Agent Learning Track
+(unofficial: `gpt-6-luna` as agent, simulator and judge). The ledger was built from the shipped
+train trajectories, and retrieval returned verified rules. Δ is percentage points of pass@1 vs.
+no memory, with 95% bootstrap intervals.
+
+| Configuration | Runs | Travel | Customer support | Shopping | Pooled |
+|---|---:|---:|---:|---:|---:|
+| Ledger (v1) | 1 | −2.7 | −0.7 | +4.7 | +0.4 [−5.6, +6.4] |
+| + agent-written verbs (v2) | 1 | +3.3 | −6.7 | −1.3 | −1.6 [−7.6, +4.2] |
+| + verbs, episode date, field-targeted induction | 3 | −0.7 | −2.7 | −0.7 | −1.3 [−5.8, +2.9] |
+| same ledger, whole rulebook sections retrieved | 1–2 | −0.7 | −2.7 | −5.3 | −2.9 [−8.0, +1.9] |
+
+**Chel did not improve task completion on this benchmark.** It did learn real, verified
+structure: for example "SAVE10 is 10% of the subtotal, rounded down" and "points redeem at
+$1 per 100", backed by verbs it wrote itself, and "an unconfirmed cancel only previews". But
+STATE-Bench failures are mostly procedural (what to ask, when to confirm), and the tools
+already compute the amounts. Two learner limits also showed up:
+- Without arithmetic over a date that never varies, fee tiers that depend on days to departure
+  were not found.
+- The example check cannot tell a memorised lookup table from a general verb.
+
+[`pi-somni`](https://github.com/Mechanacor3/pi-somni), which learns cited procedural claims and
+wiki pages, improved pooled completion by +4.7 points on the same setup.
+
+Chel's strengths are environments whose dynamics are deterministic and checkable: games,
+simulations, APIs with formula-driven outputs. There, an accepted rule is a guarantee about
+everything seen so far, not a guess.
 
 ## License
 
