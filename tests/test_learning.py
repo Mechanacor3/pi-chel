@@ -71,6 +71,15 @@ class AdapterTest(unittest.TestCase):
                 class runtime_context:
                     domain = "travel"
             got = Agent().retrieve_learnings("economy cancellation fee", 3)
+
+            class Rulebook(cb.ChelRulebookLearnings):
+                chel_root = str(pathlib.Path(tmp) / "out")
+
+                class runtime_context:
+                    domain = "travel"
+            sections = Rulebook().retrieve_learnings("cancel booking fee", 3)
+            self.assertTrue(sections[0].startswith("## Chel rulebook: cancel_booking"))
+            self.assertIn("[support 3]", sections[0])
             self.assertEqual(len(got), 1)
             self.assertIn("verified on 3 past tool results", got[0])
 

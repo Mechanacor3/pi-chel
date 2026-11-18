@@ -166,6 +166,57 @@ class ChelLearnings:
             return []
 
 
+def rulebook_sections(ledger, query, top_k=3, max_rules=25):
+    """Group active rules by action kind into readable rulebook (ψ) sections, ranked for `query`."""
+    groups = {}
+    for rid, entry in ledger.active().items():
+        groups.setdefault(entry["rule"]["when"].get("action.kind", "general"), []).append((rid, entry))
+    if not groups:
+        return []
+    names = sorted(groups)
+    docs = [ledger_terms(" ".join([name.replace("_", " ")] + [e["rule"]["text"] for _, e in groups[name]])) for name in names]
+    ranked = ledger_rank(names, docs, query)
+    out = []
+    for name in ranked[:top_k]:
+        rules = sorted(groups[name], key=lambda item: (-item[1]["support"], item[0]))[:max_rules]
+        lines = [f"## Chel rulebook: {name} (verified: each rule held on every recorded result)"]
+        lines += [f"- {e['rule']['text']} [support {e['support']}]" for _, e in rules]
+        out.append("\n".join(lines))
+    return out
+
+
+def ledger_terms(text):
+    return [t for t in re.findall(r"[a-z0-9]+", text.casefold().replace("_", " ")) if len(t) > 1]
+
+
+def ledger_rank(names, docs, query):
+    import math
+    q = set(ledger_terms(query))
+    avg = (sum(len(d) for d in docs) / len(docs)) or 1.0
+    df = {}
+    for d in docs:
+        for term in set(d):
+            df[term] = df.get(term, 0) + 1
+    scored = []
+    for name, d in zip(names, docs):
+        score = sum(math.log(1 + (len(docs) - df[t] + 0.5) / (df[t] + 0.5)) * d.count(t) * 2.2 /
+                    (d.count(t) + 1.2 * (0.25 + 0.75 * len(d) / avg)) for t in q if t in df and d.count(t))
+        if score > 0:
+            scored.append((score, name))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [name for _, name in scored]
+
+
+class ChelRulebookLearnings(ChelLearnings):
+    """Retrieval as rulebook sections: all verified rules for the most relevant tools."""
+
+    def retrieve_learnings(self, query: str, top_k: int = 3) -> list[str]:
+        try:
+            return rulebook_sections(self._chel_ledger(), query[:2000], top_k)
+        except LedgerError:
+            return []
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Build Chel learnings from STATE-Bench train trajectories")
     sub = ap.add_subparsers(dest="command", required=True)
