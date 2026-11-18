@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Memento3-style executable memory / world-model prototype for one Fishbowl attempt.
+"""Memento3-style executable memory / world model for one agent attempt.
+
+Design follows Memento 3 (Zhao et al., arXiv:2610.11794, https://arxiv.org/abs/2610.11794);
+the deterministic faithfulness check, full-history replay and error routing are Chel's own.
 
 Notation (both forms are used deliberately so text search works either way):
 

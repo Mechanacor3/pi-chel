@@ -118,6 +118,44 @@ python3 -m unittest discover -s tests -t .
 docker build -t pi-plugin-e2e:pi-1.0.0 tests/e2e && python3 -m unittest tests.test_extension_e2e
 ```
 
+## Background and credits
+
+Chel's Memento store follows the design of **Memento 3**
+([arXiv:2610.11794](https://arxiv.org/abs/2610.11794)): an agent with a frozen model keeps a
+natural-language rulebook of hypotheses about its environment, compiles it into executable code
+for prediction, and uses prediction errors to revise both. An updated model is accepted only if
+it is faithful to the rulebook and replay reproduces the observed transitions.
+
+What Chel changes or adds:
+- **Faithfulness check.** θ is a small, terminating JSON expression language, not generated
+  Python. Faithfulness to ψ is checked deterministically (structural traceability plus
+  differential agreement on a bounded probe set), not judged by a model.
+- **Full replay and error routing.** Replay always covers the complete recorded history H.
+  Mismatches are routed explicitly as `BELIEF_ERROR` (revise ψ) or `IMPLEMENTATION_ERROR` (repair
+  θ). That routing and the MDL-style simplification gate are Chel's own framing.
+- **Open-world rule ledger** (`chel/ledger.py`). Independent partial rules that must hold on all
+  history with no counterexample. This is our extension for tool-using agents whose observations
+  are too wide to predict in full.
+- Nothing here is the paper authors' code. Any errors are ours.
+
+If you use Chel, please cite the paper:
+
+```bibtex
+@misc{zhao2026memento3,
+  title         = {Memento 3: Model-Based Recursive Self-Improvement through Reflective Rulebooks},
+  author        = {Zhao, Haoyu and Yu, Zhengxu and He, Zhiyuan and Fang, Meng and Tutunov, Rasul and
+                   Bou-Ammar, Haitham and Luo, Weilin and Wang, Jun},
+  year          = {2026},
+  eprint        = {2610.11794},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI},
+  doi           = {10.48550/arXiv.2610.11794}
+}
+```
+
+Evaluation uses [STATE-Bench](https://github.com/microsoft/STATE-Bench) (MIT) and runs on
+[Pi](https://pi.dev).
+
 ## Results
 
 STATE-Bench pilot results will be added here.
