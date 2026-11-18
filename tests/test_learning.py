@@ -103,6 +103,8 @@ class AdapterTest(unittest.TestCase):
         self.assertIn("Recorded transitions: 2", text)
         self.assertIn("cancellation_fee", text)
         self.assertIn("price_paid", text)
+        same = [{**x, "obs": {**x["obs"], "now": "2026-06-15T10:00:00"}} for x in history]
+        self.assertIn("now=\"2026-06-15T10:00:00\"", learn.dossier(same, "cancel_booking"))
 
 
 class EpisodeMetaTest(unittest.TestCase):

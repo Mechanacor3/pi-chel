@@ -79,6 +79,14 @@ def dossier(history, kind, sample=24, max_fields=40):
                 varying.append((field.startswith("arg_"), count, field))
     varying.sort(key=lambda x: (not x[0], -x[1], x[2]))
     shown = [f for _, _, f in varying[:max_fields]]
+    # Constant inputs are not shown per row, but a rule or verb may need them as reference
+    # values (e.g. the current date, a fixed currency or store), so list them once.
+    constant = sorted(f for f, count in obs_fields.items()
+                      if count == len(rows) and len({_short(t["obs"].get(f)) for t in rows}) == 1)
+    if constant:
+        lines.append("")
+        lines.append("obs fields with the same value in every row (usable in rules and verbs): " +
+                     ", ".join(f"{f}={_short(rows[0]['obs'][f], 40)}" for f in constant[:max_fields]))
     lines.append("")
     lines.append(f"Sample transitions (showing {len(shown)} varying obs fields and all scalar next_obs fields):")
     step = max(1, len(rows) // sample)
