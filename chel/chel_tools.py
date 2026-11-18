@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""Bounded tool backend for the Chel Pi brain (runs inside the brain container).
+"""Bounded tool backend for Chel, the Pi memory plugin.
 
-The Pi extension `pi-ext/fishbowl-chel.ts` is a thin adapter: every model tool
-call becomes one invocation of
+The Pi extension `extensions/chel.ts` is a thin adapter: every model tool call
+becomes one invocation of
 
-    python3 -I /opt/fishbowl/chel_tools.py --workspace /workspace tool  < {"tool": NAME, "args": {...}}
+    python3 -I chel/chel_tools.py --workspace <workspace> tool  < {"tool": NAME, "args": {...}}
 
-and the JSON printed on stdout is the tool result.  Two further subcommands are
-for the trusted host driver only (via `docker exec`, never exposed as tools):
+and the JSON printed on stdout is the tool result.  Further subcommands are for
+the trusted host side only (a testbed driver or the extension's own hooks),
+never exposed as tools:
 
-    ... record  < {"obs": ..., "action": ..., "next_obs": ...}   append one H transition
-    ... view                                                     bounded prompt view
+    ... init                                                     create the Memento store
+    ... record  < {"obs": ..., "action": ..., "next_obs": ...}   append one Memento H transition
+    ... view                                                     bounded Memento prompt view
+    ... ledger-init                                              create the open-world rule ledger
+    ... ledger-record < one transition per line                  append ledger H (re-checks rules)
 
 Policy (all enforced here, so it is testable without Node):
 
+* Ledger rules change only through `Ledger.propose` (zero counterexamples
+  across all recorded history); the model cannot append ledger history.
 * Memento ψ/θ changes go only through `MementoMemory.propose` / `auto_simplify`,
   i.e. the unchanged acceptance gate.  The subject cannot append to H.
 * Scratch files: UTF-8 text inside the workspace only; every path component must
   match SAFE_COMPONENT (so no hidden names: `.git`, `.pi`, `.gitattributes`, ...);
-  `memento/` is read-only; every open walks directory fds with O_NOFOLLOW; per-file,
+  `memento/` and `chel-ledger/` are read-only; every open walks directory fds with O_NOFOLLOW; per-file,
   file-count, and total-byte quotas.
 * `scratch_commit` runs git with hooks, fsmonitor, signing, and global/system
   config disabled.
@@ -39,6 +45,7 @@ import sys
 # directory, never from the working directory or the subject workspace.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from memento_memory import KINDS, MAX_TEXT, MEMENTO_DIR, MementoMemory, canonical, description_length, digest  # noqa: E402
+from ledger import LEDGER_DIR, Ledger, LedgerError  # noqa: E402
 
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 MAX_DEPTH = 8
@@ -57,7 +64,7 @@ HISTORY_TAIL = 8
 MAX_REPORTED = 10
 GIT_CONFIG = (
     "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-    "-c", "user.name=chel", "-c", "user.email=chel@fishbowl.invalid", "-c", "core.autocrlf=false",
+    "-c", "user.name=chel", "-c", "user.email=chel@localhost.invalid", "-c", "core.autocrlf=false",
 )
 GIT_ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
            "HOME": "/nonexistent", "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"}
@@ -122,6 +129,8 @@ def split_path(path, allow_root=False):
 def _writable(parts):
     if parts[0] == MEMENTO_DIR:
         raise ToolError("memento/ is read-only here; change ψ/θ with memento_propose")
+    if parts[0] == LEDGER_DIR:
+        raise ToolError("chel-ledger/ is read-only here; change rules with ledger_propose")
 
 
 # ----------------------------------------------------------- confined file I/O
@@ -416,7 +425,49 @@ def memento_simplify(ws, args):
     return out
 
 
+def _ledger(ws):
+    if ws.lstat(ws.fd, LEDGER_DIR) is None:
+        raise ToolError("the rule ledger is not initialized in this workspace")
+    try:
+        return Ledger(ws.path).load()
+    except LedgerError as exc:
+        raise ToolError(f"ledger refused to load: {exc}") from None
+
+
+def ledger_status(ws, args):
+    _args(args, ())
+    ledger = _ledger(ws)
+    rules = {rid: {"text": v["text"], "support": v["support"]} for rid, v in ledger.rules_view().items() if v["state"] == "active"}
+    return {**ledger.status(), "active_rules": dict(list(sorted(rules.items()))[:MAX_LIST])}
+
+
+def ledger_recall(ws, args):
+    args = _args(args, ("query", "top_k"), ("query",))
+    query = _str(args["query"], "query", 2000)
+    top_k = _int(args.get("top_k"), "top_k", 1, 20, 5)
+    return {"rules": _ledger(ws).recall(query, top_k)}
+
+
+def ledger_propose(ws, args):
+    args = _args(args, ("op", "rule_json", "target", "reason", "rationale"), ("op",))
+    op = _str(args["op"], "op", 16)
+    proposal = {"op": op, "rationale": _str(args.get("rationale", ""), "rationale", MAX_TEXT, allow_empty=True)}
+    if op in ("add", "revise"):
+        proposal["rule"] = _json_arg(args.get("rule_json"), "rule_json")
+    if op in ("revise", "retract"):
+        proposal["target"] = _str(args.get("target"), "target", 64)
+    if op == "retract":
+        proposal["reason"] = _str(args.get("reason"), "reason", MAX_TEXT)
+    try:
+        return _ledger(ws).propose(proposal)
+    except LedgerError as exc:
+        raise ToolError(str(exc)) from None
+
+
 TOOLS = {
+    "ledger_status": ledger_status,
+    "ledger_recall": ledger_recall,
+    "ledger_propose": ledger_propose,
     "memento_status": memento_status,
     "memento_history": memento_history,
     "memento_propose": memento_propose,
@@ -455,7 +506,7 @@ def _stdin_json(limit=MAX_JSON_ARG * 3):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("command", choices=("tool", "record", "view", "init"))
+    ap.add_argument("command", choices=("tool", "record", "view", "init", "ledger-init", "ledger-record"))
     args = ap.parse_args(argv)
     if args.command == "tool":
         try:
@@ -473,6 +524,17 @@ def main(argv=None):
             else:
                 memory = MementoMemory.create(args.workspace)
             out = {"rev": memory.current_rev(), "history_len": len(memory.history)}
+        elif args.command == "ledger-init":
+            if os.path.lexists(os.path.join(args.workspace, LEDGER_DIR)):
+                out = Ledger(args.workspace).load().status()
+            else:
+                out = Ledger.create(args.workspace).status()
+        elif args.command == "ledger-record":
+            data = sys.stdin.buffer.read(MAX_JSON_ARG * 4 + 1)
+            if len(data) > MAX_JSON_ARG * 4:
+                raise ToolError("request too large")
+            lines = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+            out = Ledger(args.workspace).load().record(lines)
         elif args.command == "record":
             memory = MementoMemory.load(args.workspace)
             out = memory.record(_stdin_json())

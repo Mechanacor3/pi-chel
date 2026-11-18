@@ -10,6 +10,8 @@ import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
+CHEL = HERE.parent / "chel"
+sys.path.insert(0, str(CHEL))
 sys.path.insert(0, str(HERE))
 import memento_memory as mm  # noqa: E402
 
@@ -317,7 +319,7 @@ class SimplificationTest(MementoTestCase):
 
 class CliTest(MementoTestCase):
     def cli(self, *args):
-        return subprocess.run([sys.executable, HERE / "memento_memory.py", "--workspace", self.workspace, *map(str, args)],
+        return subprocess.run([sys.executable, CHEL / "memento_memory.py", "--workspace", self.workspace, *map(str, args)],
                               text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def test_cli_round_trip_and_workspace_confinement(self):

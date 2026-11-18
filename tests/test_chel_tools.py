@@ -10,6 +10,8 @@ import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
+CHEL = HERE.parent / "chel"
+sys.path.insert(0, str(CHEL))
 sys.path.insert(0, str(HERE))
 import chel_tools as ct  # noqa: E402
 import memento_memory as mm  # noqa: E402
@@ -165,7 +167,7 @@ class ChelToolsTest(unittest.TestCase):
         self.assertIn("accepted", self.ok("memento_simplify", max_candidates=4))
 
     def test_trusted_cli_record_view_and_tool(self):
-        script = str(HERE / "chel_tools.py")
+        script = str(CHEL / "chel_tools.py")
         run = lambda cmd, payload=None: subprocess.run(  # noqa: E731
             [sys.executable, "-I", script, "--workspace", str(self.ws), cmd],
             input="" if payload is None else json.dumps(payload), capture_output=True, text=True)
@@ -179,6 +181,44 @@ class ChelToolsTest(unittest.TestCase):
         garbage = run("tool")
         self.assertFalse(json.loads(garbage.stdout)["ok"])
 
+
+class ChelLedgerToolsTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.ws = pathlib.Path(self.temporary.name) / "workspace"
+        self.ws.mkdir()
+        self.cli = [sys.executable, "-I", str(CHEL / "chel_tools.py"), "--workspace", str(self.ws)]
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def tool(self, name, **args):
+        return ct.run_tool(str(self.ws), {"tool": name, "args": args})
+
+    def test_ledger_tools_require_init_and_route_through_the_gate(self):
+        self.assertIn("not initialized", self.tool("ledger_status")["error"])
+        self.assertEqual(subprocess.run([*self.cli, "ledger-init"], capture_output=True).returncode, 0)
+        rows = [{"obs": {"arg_confirm": False}, "action": {"kind": "cancel"}, "next_obs": {"status": "preview"}}] * 3
+        rec = subprocess.run([*self.cli, "ledger-record"], input="\n".join(json.dumps(r) for r in rows),
+                             capture_output=True, text=True)
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        rule = {"id": "P1", "text": "Unconfirmed cancel only previews.", "when": {"action.kind": "cancel", "obs.arg_confirm": False},
+                "then": {"status": {"set": "preview"}}}
+        out = self.tool("ledger_propose", op="add", rule_json=json.dumps(rule), rationale="seen three times")
+        self.assertTrue(out["ok"] and out["result"]["accepted"], out)
+        wrong = {**rule, "id": "P2", "then": {"status": {"set": "cancelled"}}}
+        out = self.tool("ledger_propose", op="add", rule_json=json.dumps(wrong))
+        self.assertFalse(out["result"]["accepted"])
+        self.assertEqual(out["result"]["counterexamples"][0]["mismatch"]["status"]["actual"], "preview")
+        self.assertEqual(self.tool("ledger_recall", query="cancel preview")["result"]["rules"][0]["id"], "P1")
+        self.assertEqual(self.tool("ledger_status")["result"]["rules"], {"active": 1})
+
+    def test_ledger_directory_is_read_only_to_scratch_tools(self):
+        subprocess.run([*self.cli, "ledger-init"], check=True, capture_output=True)
+        out = self.tool("scratch_write", path="chel-ledger/history.jsonl", content="{}\n", mode="append")
+        self.assertFalse(out["ok"])
+        self.assertIn("read-only", out["error"])
+        self.assertFalse(self.tool("scratch_delete", path="chel-ledger/rules.json")["ok"])
 
 if __name__ == "__main__":
     unittest.main()

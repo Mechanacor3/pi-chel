@@ -1,0 +1,15 @@
+{
+  "name": "pi-chel",
+  "version": "0.1.0",
+  "description": "Chel: verified-belief memory for the Pi coding agent. Rules are kept only if they hold on all recorded history.",
+  "keywords": ["pi-package", "pi", "memory", "agent-memory", "world-model"],
+  "license": "MIT",
+  "type": "module",
+  "repository": {"type": "git", "url": "git+https://github.com/Mechanacor3/pi-chel.git"},
+  "files": ["extensions/", "chel/*.py", "prompts/", "adapters/", "README.md", "LICENSE"],
+  "pi": {"extensions": ["./extensions/chel.ts"]},
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
