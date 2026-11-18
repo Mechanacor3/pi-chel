@@ -67,12 +67,16 @@ def flatten(value, prefix=""):
     return out
 
 
-def trajectory_transitions(conversation):
+def trajectory_transitions(conversation, episode=None):
+    """`episode` (optional) is per-episode metadata the agent saw, e.g. {"now": ...};
+    it is part of every observation in the episode."""
+    pinned = flatten(episode or {})
     context, out = {}, []
     for message in conversation:
         for call in (message.get("tool_calls") or []) if message.get("role") == "assistant" else []:
             args = {field_name("arg_" + k): v for k, v in flatten(call.get("arguments") or {}).items()}
             obs = dict(list(context.items())[-CONTEXT_FIELDS:])
+            obs.update(pinned)
             obs.update(args)
             if len(obs) > MAX_FIELDS:
                 obs = dict(list(obs.items())[-MAX_FIELDS:])
@@ -87,7 +91,7 @@ def trajectory_transitions(conversation):
     return out
 
 
-def build(train_dir, workspace, complete, *, rounds=3, min_support=2, log=print, limit=None):
+def build(train_dir, workspace, complete, *, rounds=3, min_support=2, log=print, limit=None, episode_meta=None):
     from learn import induce
 
     train_dir, workspace = pathlib.Path(train_dir), pathlib.Path(workspace)
@@ -96,13 +100,41 @@ def build(train_dir, workspace, complete, *, rounds=3, min_support=2, log=print,
     ledger = Ledger.create(workspace, min_support=min_support)
     transitions = []
     for path in files:
-        transitions.extend(trajectory_transitions(json.loads(path.read_text()).get("conversation") or []))
+        transitions.extend(trajectory_transitions(json.loads(path.read_text()).get("conversation") or [],
+                                                  _episode_for(path.stem, episode_meta)))
     ledger.record(transitions)
     log(f"recorded {len(transitions)} transitions from {len(files)} trajectories")
     trace = induce(ledger, complete, rounds=rounds, log=log)
-    summary = {"trajectories": len(files), "transitions": len(transitions), "status": ledger.load().status(), "induction": trace}
+    summary = {"trajectories": len(files), "transitions": len(transitions), "episode_meta": bool(episode_meta), "status": ledger.load().status(), "induction": trace}
     (workspace / "build-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     return summary
+
+
+def train_episode_meta(task_dir, split_file, fields=("now",)):
+    """Episode metadata for TRAIN tasks only: {task_id: {field: value}}.
+
+    STATE-Bench redacts "Today's date" in the shipped train trajectories, but each
+    train task file records the episode's `now`, which a live agent would see. Only
+    ids listed in the split file's train split are read; anything else is refused,
+    so no test task can leak into learning.
+    """
+    split = json.loads(pathlib.Path(split_file).read_text())["splits"]
+    train, test = set(split["train"]), set(split.get("test", []))
+    meta = {}
+    for task_id in sorted(train - test):
+        path = pathlib.Path(task_dir) / f"{task_id}.json"
+        if path.exists():
+            task = json.loads(path.read_text())
+            meta[task_id] = {f: task[f] for f in fields if f in task}
+    return meta
+
+
+def _episode_for(task_id, episode_meta):
+    if episode_meta is None:
+        return None
+    if task_id not in episode_meta:
+        raise ValueError(f"no train-split episode metadata for {task_id}; refusing to guess")
+    return episode_meta[task_id]
 
 
 def render(rule):
@@ -144,6 +176,8 @@ def main(argv=None):
     b.add_argument("--reasoning-effort", default="medium")
     b.add_argument("--rounds", type=int, default=3)
     b.add_argument("--limit", type=int, default=None)
+    b.add_argument("--task-dir", help="STATE-Bench domain tasks/ dir: add each TRAIN episode's `now` (needs --split-file)")
+    b.add_argument("--split-file", help="STATE-Bench splits/train_test.json; only its train ids are read")
     r = sub.add_parser("recall")
     r.add_argument("--workspace", required=True)
     r.add_argument("query")
@@ -152,7 +186,8 @@ def main(argv=None):
     if args.command == "build":
         from llm import openai_completer
         complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)
-        summary = build(args.train_dir, args.workspace, complete, rounds=args.rounds, limit=args.limit)
+        meta = train_episode_meta(args.task_dir, args.split_file) if args.task_dir else None
+        summary = build(args.train_dir, args.workspace, complete, rounds=args.rounds, limit=args.limit, episode_meta=meta)
         summary["model"], summary["model_usage"] = args.model, complete.usage.as_dict()
         (pathlib.Path(args.workspace) / "build-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
         print(json.dumps({k: v for k, v in summary.items() if k != "induction"}, indent=2))

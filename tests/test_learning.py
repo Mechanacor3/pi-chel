@@ -105,5 +105,30 @@ class AdapterTest(unittest.TestCase):
         self.assertIn("price_paid", text)
 
 
+class EpisodeMetaTest(unittest.TestCase):
+    def make(self, tmp):
+        tasks = pathlib.Path(tmp) / "tasks"
+        tasks.mkdir()
+        for task_id, now in (("1-train", "2026-06-15T10:00:00"), ("2-test", "2026-07-01T09:00:00")):
+            (tasks / f"{task_id}.json").write_text(json.dumps({"task_id": task_id, "now": now, "task_summary": "secret"}))
+        split = pathlib.Path(tmp) / "split.json"
+        split.write_text(json.dumps({"splits": {"train": ["1-train"], "test": ["2-test"]}}))
+        return tasks, split
+
+    def test_only_train_ids_and_only_requested_fields_are_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks, split = self.make(tmp)
+            meta = cb.train_episode_meta(tasks, split)
+            self.assertEqual(meta, {"1-train": {"now": "2026-06-15T10:00:00"}})
+            self.assertEqual(cb._episode_for("1-train", meta), {"now": "2026-06-15T10:00:00"})
+            with self.assertRaisesRegex(ValueError, "refusing"):
+                cb._episode_for("2-test", meta)
+            self.assertIsNone(cb._episode_for("anything", None))
+
+    def test_now_is_part_of_every_observation(self):
+        t = cb.trajectory_transitions(conversation(600, 90), {"now": "2026-06-15T10:00:00"})
+        self.assertTrue(all(x["obs"]["now"] == "2026-06-15T10:00:00" for x in t))
+
+
 if __name__ == "__main__":
     unittest.main()
